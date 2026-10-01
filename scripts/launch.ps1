@@ -51,15 +51,17 @@ foreach($name in @('LoadFolders.xml','LICENSE','LICENSE-rimUIMCP','THIRD_PARTY_N
     if(Test-Path -LiteralPath $item){Copy-Item -LiteralPath $item -Destination $modRoot -Force}
 }
 $config=Join-Path $profile 'Config\ModsConfig.xml'
+$utf8NoBom=New-Object System.Text.UTF8Encoding($false)
 if(-not (Test-Path -LiteralPath $config)) {
-    @"
+    $modsConfig=@"
 <?xml version="1.0" encoding="utf-8"?>
 <ModsConfigData>
   <version>1.6.4871 rev590</version>
   <activeMods><li>brrainz.harmony</li><li>ludeon.rimworld</li><li>$packageId</li></activeMods>
   <knownExpansions><li>ludeon.rimworld</li></knownExpansions>
 </ModsConfigData>
-"@ | Set-Content -LiteralPath $config -Encoding utf8
+"@
+    [System.IO.File]::WriteAllText($config,$modsConfig,$utf8NoBom)
 }
 $env:RIMUIMCP_FIXTURE= $(if($Fixture){'1'}else{'0'})
 $env:RIMUIMCP_ROOT=$projectRoot
@@ -67,7 +69,7 @@ if(Test-Path -LiteralPath $logPath) {
     $archive=Join-Path $projectRoot ('work\Player-'+(Get-Date -Format 'yyyyMMdd-HHmmss')+'.log')
     Move-Item -LiteralPath $logPath -Destination $archive
 }
-$argList=@(('-savedatafolder='+$profile),'-logFile',$logPath,'-screen-fullscreen',$(if($Fullscreen){'1'}else{'0'}),'-screen-width',[string]$WindowWidth,'-screen-height',[string]$WindowHeight)
+$argList=@(('-savedatafolder='+$profile),'-logFile',$logPath,'-popupwindow','-screen-fullscreen',$(if($Fullscreen){'1'}else{'0'}),'-screen-width',[string]$WindowWidth,'-screen-height',[string]$WindowHeight)
 if($Monitor -gt 0){$argList+=@('-monitor',[string]$Monitor)}
 $windowStyle=if($Visible){'Normal'}else{'Hidden'}
 $process=Start-Process -FilePath $gameExe -WorkingDirectory $gameRoot -ArgumentList $argList -WindowStyle $windowStyle -PassThru
@@ -81,7 +83,8 @@ while((Get-Date) -lt $deadline) {
         $port=[regex]::Match($log,'GABP server running standalone on port (\d+)')
         $token=[regex]::Match($log,'Bridge token: (\S+)')
         if($port.Success -and $token.Success) {
-            [ordered]@{host='127.0.0.1';port=[int]$port.Groups[1].Value;token=$token.Groups[1].Value;gamePid=$process.Id} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $projectRoot 'work\connection.json') -Encoding utf8
+            $connection=[ordered]@{host='127.0.0.1';port=[int]$port.Groups[1].Value;token=$token.Groups[1].Value;gamePid=$process.Id} | ConvertTo-Json
+            [System.IO.File]::WriteAllText((Join-Path $projectRoot 'work\connection.json'),$connection,$utf8NoBom)
             if(-not $UseBaseline) {
                 $hostRunning=$false
                 try { $hostRunning=(Invoke-RestMethod -Uri 'http://127.0.0.1:18741/health' -TimeoutSec 2).pid -gt 0 } catch { }
