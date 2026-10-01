@@ -26,7 +26,7 @@ Curated wrappers (results are the raw rimUIMCP JSON):
 | `rimworld_pawns` | `state.pawns` |
 | `rimworld_map` | `state.map` |
 | `rimworld_ui_snapshot` | `ui.snapshot` |
-| `rimworld_screenshot` | `ui.screenshot` (returns an image) |
+| `rimworld_screenshot` | `ui.screenshot` (inline image, see below) |
 | `rimworld_pause` | `runtime.pause` |
 | `rimworld_advance` | `runtime.advance` |
 | `rimworld_select_pawn` | `ui.select` |
@@ -37,6 +37,14 @@ Plus `rimuimcp_call` — the generic passthrough for any method:
 ```json
 { "method": "state.read", "args": { "root": "currentMap" }, "timeoutMs": 30000 }
 ```
+
+## Screenshots
+
+`ui.screenshot` writes a PNG to disk and returns its path. `rimworld_screenshot` reads that file and returns it as an inline image so the model can see it directly.
+
+- **Default**: compressed to fit `maxWidth`/`maxHeight`/`maxBytes` (defaults `1280`/`1280`/`1500000`, `jpegQuality` `78`). A 2560x1440 capture shrinks from ~2.9 MB to ~130 KB.
+- **`full: true`**: returns the original full-resolution PNG (pi still applies its own model-specific normalization on top).
+- Other knobs: `name`, `maxWidth`, `maxHeight`, `maxBytes`, `jpegQuality`.
 
 ## Command
 

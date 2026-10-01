@@ -23,7 +23,8 @@
 
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { readFile } from "node:fs/promises";
+import { resizeImage, formatDimensionNote, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { StdioMcpClient, type McpCallResult, type McpContent, type McpTool } from "./mcp-client.ts";
 
@@ -42,6 +43,7 @@ const GUIDELINES = [
 	"Read pawn/thing ids from rimworld_pawns and coordinates from rimworld_map / rimworld_pawns; references are session- and world-version-bound and must be re-queried after loading a save.",
 	"Collection reads may paginate: check total/nextCursor instead of assuming one page is the whole map.",
 	"Prefer the curated rimworld_* tools; fall back to rimuimcp_call for any method without a wrapper.",
+	"rimworld_screenshot returns a compressed inline image by default; pass full=true when fine detail is still unclear.",
 ];
 
 interface CuratedTool {
@@ -76,7 +78,7 @@ const CURATED: CuratedTool[] = [
 	curated("rimworld_pawns", "pawns", "state.pawns", "Read pawns/colonists on the current map", "Read pawns on the current map (paginated). Inspect total and nextCursor; results are under data.items.", Type.Object({ budgetMs: opt(Type.Number()), limit: opt(Type.Number()), cursor: opt(Type.String()) })),
 	curated("rimworld_map", "map", "state.map", "Read current map summary (size, biome, counts)", "Read the current map summary: id, width, height, biome, thing/building counts.", Type.Object({})),
 	curated("rimworld_ui_snapshot", "ui snapshot", "ui.snapshot", "Snapshot currently visible UI controls", "Snapshot the currently visible UI controls so they can be located and activated by later actions.", Type.Object({ surface: opt(Type.String()) })),
-	curated("rimworld_screenshot", "screenshot", "ui.screenshot", "Screenshot the game screen (returns an image)", "Capture the game screen and return it as an image you can look at.", Type.Object({ name: opt(Type.String()) })),
+	curated("rimworld_screenshot", "screenshot", "ui.screenshot", "Screenshot the game as an inline image (compressed by default)", "Capture the game screen and return it as an inline image. Compressed to fit maxWidth/maxHeight/maxBytes by default; pass full=true to return the original full-resolution PNG when you need to look closely.", Type.Object({ name: opt(Type.String()), full: opt(Type.Boolean()), maxWidth: opt(Type.Number()), maxHeight: opt(Type.Number()), maxBytes: opt(Type.Number()), jpegQuality: opt(Type.Number()) })),
 	curated("rimworld_pause", "pause/resume", "runtime.pause", "Pause or resume the simulation", "Pause (default) or resume the simulation.", Type.Object({ paused: opt(Type.Boolean()) }), { paused: true }),
 	curated("rimworld_advance", "advance ticks", "runtime.advance", "Advance the simulation by N ticks", "Advance the simulation by a number of ticks.", Type.Object({ ticks: Type.Number() })),
 	curated("rimworld_select_pawn", "select pawn", "ui.select", "Select a pawn by id", "Select a pawn by id (from rimworld_pawns).", Type.Object({ pawnId: Type.String() })),
@@ -85,6 +87,13 @@ const CURATED: CuratedTool[] = [
 
 const GENERIC_SNIPPET = "Call any rimUIMCP method directly (method + args); escape hatch for methods without a curated wrapper";
 
+/** Aggressive defaults so an inline screenshot costs far less context than the 2.9MB original. */
+const SCREENSHOT_DEFAULTS = { maxWidth: 1280, maxHeight: 1280, maxBytes: 1_500_000, jpegQuality: 78 };
+
+function num(value: unknown, fallback: number): number {
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
 function toPiContent(result: McpCallResult) {
 	const content: Array<Record<string, unknown>> = [];
 	for (const item of result.content ?? []) {
@@ -92,7 +101,7 @@ function toPiContent(result: McpCallResult) {
 		if (typed.type === "text" && typeof typed.text === "string") {
 			content.push({ type: "text", text: typed.text });
 		} else if (typed.type === "image" && typed.data) {
-			content.push({ type: "image", source: { type: "base64", mediaType: typed.mimeType || "image/png", data: typed.data } });
+			content.push({ type: "image", data: typed.data, mimeType: typed.mimeType || "image/png" });
 		} else if (typed.type === "resource" && typed.text) {
 			content.push({ type: "text", text: typed.text });
 		} else {
@@ -137,6 +146,62 @@ export default function rimuimcpExtension(pi: ExtensionAPI) {
 		}
 	}
 
+	async function runScreenshot(params: Record<string, unknown>, signal?: AbortSignal) {
+		const details: Record<string, unknown> = { tool: "rimworld_screenshot", method: "ui.screenshot" };
+		try {
+			const result = await callMethod("ui.screenshot", params.name !== undefined ? { name: params.name } : {}, signal);
+			const text = (result.content ?? []).find((item) => item.type === "text" && typeof item.text === "string")?.text;
+			let payload: any;
+			try {
+				payload = text ? JSON.parse(text) : undefined;
+			} catch {}
+			const data = payload?.data ?? payload;
+			const filePath = typeof data?.path === "string" ? data.path : undefined;
+			if (!filePath) {
+				return { content: toPiContent(result), details, ...(result.isError ? { isError: true } : {}) } as any;
+			}
+
+			const bytes = await readFile(filePath);
+			const original = () => ({ type: "image", data: Buffer.from(bytes).toString("base64"), mimeType: "image/png" });
+
+			if (params.full === true) {
+				details.mode = "full";
+				details.path = filePath;
+				details.bytes = bytes.length;
+				return { content: [original(), { type: "text", text: `Original screenshot (${Math.round(bytes.length / 1024)}KB): ${filePath}` }], details } as any;
+			}
+
+			const resized = await resizeImage(new Uint8Array(bytes), "image/png", {
+				maxWidth: num(params.maxWidth, SCREENSHOT_DEFAULTS.maxWidth),
+				maxHeight: num(params.maxHeight, SCREENSHOT_DEFAULTS.maxHeight),
+				maxBytes: num(params.maxBytes, SCREENSHOT_DEFAULTS.maxBytes),
+				jpegQuality: num(params.jpegQuality, SCREENSHOT_DEFAULTS.jpegQuality),
+			});
+			details.path = filePath;
+			details.bytes = bytes.length;
+
+			if (!resized) {
+				details.mode = "original-fallback";
+				return { content: [original(), { type: "text", text: `Resize unavailable; returning the original (${Math.round(bytes.length / 1024)}KB): ${filePath}` }], details } as any;
+			}
+
+			details.mode = "compressed";
+			details.width = resized.width;
+			details.height = resized.height;
+			details.wasResized = resized.wasResized;
+			const approxKb = Math.round(((resized.data.length * 3) / 4) / 1024);
+			const summary = resized.wasResized
+				? `Screenshot ${resized.originalWidth}x${resized.originalHeight} -> ${resized.width}x${resized.height} (${approxKb}KB). Pass full=true for the original.`
+				: `Screenshot ${resized.width}x${resized.height} (${approxKb}KB).`;
+			const meta = [summary, formatDimensionNote(resized), filePath].filter(Boolean).join("\n");
+			return { content: [{ type: "image", data: resized.data, mimeType: resized.mimeType }, { type: "text", text: meta }], details } as any;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			if (message === "cancelled") return { content: [{ type: "text", text: "Cancelled." }], details } as any;
+			return { content: [{ type: "text", text: `rimworld_screenshot failed: ${message}` }], details, isError: true } as any;
+		}
+	}
+
 	function registerCurated() {
 		for (const tool of CURATED) {
 			if (registered.has(tool.name)) continue;
@@ -149,7 +214,9 @@ export default function rimuimcpExtension(pi: ExtensionAPI) {
 				promptGuidelines: GUIDELINES,
 				parameters: tool.parameters as any,
 				async execute(_toolCallId, params, signal) {
-					return runTool(tool, (params ?? {}) as Record<string, unknown>, signal);
+					const args = (params ?? {}) as Record<string, unknown>;
+					if (tool.name === "rimworld_screenshot") return runScreenshot(args, signal);
+					return runTool(tool, args, signal);
 				},
 			});
 		}
